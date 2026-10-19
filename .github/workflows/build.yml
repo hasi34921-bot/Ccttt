@@ -1,0 +1,445 @@
+name: Build APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/example/notifforwarder
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "NotifForwarder"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.notifforwarder"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.notifforwarder"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="Notif"
+                  android:theme="@android:style/Theme.Material"
+                  android:usesCleartextTraffic="false">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".NotifService"
+                      android:exported="true"
+                      android:label="Notif"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/com/example/notifforwarder/MainActivity.kt <<'EOF_FILE'
+          package com.example.notifforwarder
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Toast
+          import okhttp3.Call
+          import okhttp3.Callback
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import okhttp3.Response
+          import org.json.JSONObject
+          import java.io.IOException
+
+          class MainActivity : Activity() {
+
+              private val client = OkHttpClient()
+              private lateinit var urlField: EditText
+              private lateinit var pkgField: EditText
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                      setBackgroundColor(Color.BLACK)
+                  }
+
+                  urlField = EditText(this).apply {
+                      hint = "Webhook URL (https://...)"
+                      inputType = InputType.TYPE_TEXT_VARIATION_URI
+                      setText(prefs.getString("url", ""))
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.GRAY)
+                  }
+                  pkgField = EditText(this).apply {
+                      hint = "Package (কমা দিয়ে)। খালি = সব অ্যাপ"
+                      setText(prefs.getString("pkgs", ""))
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.GRAY)
+                      visibility = View.GONE
+                  }
+
+                  val lp = LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.MATCH_PARENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply { topMargin = pad / 2 }
+
+                  root.addView(urlField, lp)
+                  root.addView(pkgField, lp)
+                  root.addView(button("Choice") { chooseApps() }, lp)
+                  root.addView(button("Save") { save(true) }, lp)
+                  root.addView(button("Test") { sendTest() }, lp)
+                  root.addView(button("Notification Access চালু করুন") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }, lp)
+                  root.addView(button("Battery Optimization সেটিংস") {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }, lp)
+
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                      isFillViewport = true
+                      addView(root)
+                  }
+                  setContentView(scroll)
+              }
+
+              private fun button(label: String, onClick: () -> Unit): Button {
+                  return Button(this).apply {
+                      text = label
+                      setTextColor(Color.WHITE)
+                      setBackgroundColor(0xFF333333.toInt())
+                      setOnClickListener { onClick() }
+                  }
+              }
+
+              private fun save(showToast: Boolean) {
+                  getSharedPreferences("cfg", MODE_PRIVATE).edit()
+                      .putString("url", urlField.text.toString().trim())
+                      .putString("pkgs", pkgField.text.toString().trim())
+                      .apply()
+                  if (showToast) toast("Saved")
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+              }
+
+              private fun chooseApps() {
+                  val pm = packageManager
+                  val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = pm.queryIntentActivities(main, 0)
+                      .map { Pair(it.loadLabel(pm).toString(), it.activityInfo.packageName) }
+                      .filter { it.second != packageName }
+                      .distinctBy { it.second }
+                      .sortedBy { it.first.lowercase() }
+
+                  val selected = pkgField.text.toString()
+                      .split(",").map { it.trim() }.filter { it.isNotEmpty() }.toMutableSet()
+                  val names = apps.map { it.first }.toTypedArray()
+                  val checked = BooleanArray(apps.size) { apps[it].second in selected }
+
+                  AlertDialog.Builder(this)
+                      .setTitle("Choice")
+                      .setMultiChoiceItems(names, checked) { _, i, isChecked ->
+                          if (isChecked) selected.add(apps[i].second) else selected.remove(apps[i].second)
+                      }
+                      .setPositiveButton("OK") { _, _ ->
+                          pkgField.setText(selected.joinToString(","))
+                          save(true)
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun sendTest() {
+                  save(false)
+                  val url = urlField.text.toString().trim()
+                  if (url.isEmpty()) {
+                      toast("আগে URL দিন")
+                      return
+                  }
+                  val json = JSONObject().apply {
+                      put("app", "test")
+                      put("title", "Test")
+                      put("text", "Test notification")
+                  }
+                  val req = try {
+                      Request.Builder().url(url)
+                          .post(json.toString().toRequestBody("application/json".toMediaType()))
+                          .build()
+                  } catch (ex: Exception) {
+                      toast("URL ঠিক নেই")
+                      return
+                  }
+                  client.newCall(req).enqueue(object : Callback {
+                      override fun onFailure(call: Call, e: IOException) {
+                          runOnUiThread { toast("Failed: " + e.message) }
+                      }
+
+                      override fun onResponse(call: Call, response: Response) {
+                          val code = response.code
+                          response.close()
+                          runOnUiThread { toast("Sent, code " + code) }
+                      }
+                  })
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/java/com/example/notifforwarder/NotifService.kt <<'EOF_FILE'
+          package com.example.notifforwarder
+
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+          import okhttp3.*
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONObject
+          import java.io.IOException
+
+          class NotifService : NotificationListenerService() {
+
+              private val client = OkHttpClient()
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (sbn.packageName == packageName) return
+                  if (sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+
+                  val prefs = getSharedPreferences("cfg", MODE_PRIVATE)
+                  val url = prefs.getString("url", "").orEmpty()
+                  if (url.isBlank()) return
+
+                  val allowed = prefs.getString("pkgs", "").orEmpty()
+                      .split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                  if (allowed.isNotEmpty() && sbn.packageName !in allowed) return
+
+                  val e = sbn.notification.extras
+                  val json = JSONObject().apply {
+                      put("app", sbn.packageName)
+                      put("title", e.getCharSequence(Notification.EXTRA_TITLE)?.toString())
+                      put("text", e.getCharSequence(Notification.EXTRA_TEXT)?.toString())
+                      put("time", sbn.postTime)
+                  }
+
+                  val req = Request.Builder()
+                      .url(url)
+                      .post(json.toString().toRequestBody("application/json".toMediaType()))
+                      .build()
+
+                  client.newCall(req).enqueue(object : Callback {
+                      override fun onFailure(call: Call, e: IOException) {}
+                      override fun onResponse(call: Call, response: Response) { response.close() }
+                  })
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@android:color/transparent"/>
+              <foreground android:drawable="@mipmap/ic_launcher_fg"/>
+          </adaptive-icon>
+          EOF_FILE
+          base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png <<'EOF_B64A'
+          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
+          4ILjAAAAAElFTkSuQmCC
+          EOF_B64A
+          base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher_fg.png <<'EOF_B64B'
+          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
+          EOF_B64B
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
